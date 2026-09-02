@@ -1069,3 +1069,101 @@ def worst_attribute_bins(
             )
             .head(top_n)
         )
+
+
+def concordance_correlation_coefficient(y_true, y_pred):
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_pred)
+
+    mean_true = np.mean(y_true)
+    mean_pred = np.mean(y_pred)
+
+    var_true = np.var(y_true)
+    var_pred = np.var(y_pred)
+
+    covariance = np.mean(
+        (y_true - mean_true) *
+        (y_pred - mean_pred)
+    )
+
+    ccc = (
+        2 * covariance /
+        (
+            var_true
+            + var_pred
+            + (mean_true - mean_pred) ** 2
+        )
+    )
+
+    return ccc
+
+
+actual_low = y_true <= 545
+pred_low = y_pred <= 545
+
+from sklearn.metrics import (
+    precision_score,
+    recall_score,
+    f1_score
+)
+
+low_rv_recall = recall_score(
+    actual_low,
+    pred_low
+)
+
+low_rv_precision = precision_score(
+    actual_low,
+    pred_low
+)
+
+low_rv_f1 = f1_score(
+    actual_low,
+    pred_low
+)
+
+abs_error = np.abs(residual)
+
+return {
+    "N": len(y_true),
+
+    # Overall fit
+    "R2": r2,
+    "MAE": mean_absolute_error(y_true, y_pred),
+    "RMSE": np.sqrt(mean_squared_error(y_true, y_pred)),
+    "Spearman": spearman,
+    "Pearson": pearsonr(y_true, y_pred)[0],
+
+    # Agreement
+    "CCC": concordance_correlation_coefficient(
+        y_true, y_pred
+    ),
+
+    # Bias
+    "Mean Residual": float(np.mean(residual)),
+    "Median Residual": float(np.median(residual)),
+    "Residual Std": float(np.std(residual, ddof=1)),
+
+    # Error distribution
+    "Median AE": float(np.median(abs_error)),
+    "P90 AE": float(np.percentile(abs_error, 90)),
+    "P95 AE": float(np.percentile(abs_error, 95)),
+    "P99 AE": float(np.percentile(abs_error, 99)),
+
+    # Practical accuracy
+    "Within 10": float(np.mean(abs_error <= 10)),
+    "Within 20": float(np.mean(abs_error <= 20)),
+    "Within 30": float(np.mean(abs_error <= 30)),
+
+    # Distribution replication
+    "Actual Std": float(np.std(y_true, ddof=1)),
+    "Prediction Std": float(np.std(y_pred, ddof=1)),
+    "Std Ratio": float(
+        np.std(y_pred, ddof=1) /
+        np.std(y_true, ddof=1)
+    ),
+
+    # Location
+    "Mean Prediction": float(np.mean(y_pred)),
+    "Mean Actual": float(np.mean(y_true)),
+}
