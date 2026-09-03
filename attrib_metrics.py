@@ -1167,3 +1167,568 @@ return {
     "Mean Prediction": float(np.mean(y_pred)),
     "Mean Actual": float(np.mean(y_true)),
 }
+
+
+import numpy as np
+import pandas as pd
+
+from sklearn.metrics import roc_auc_score
+from sklearn.feature_selection import mutual_info_classif
+
+
+# ============================================================
+# 1. BINNING HELPER
+# ============================================================
+
+def make_bins(
+    s,
+    n_bins=10,
+    method="quantile",
+    custom_bins=None,
+    special_values=None,
+    categorical_threshold=10
+):
+    """
+    Create bins for one attribute.
+
+    Parameters
+    ----------
+    s : pd.Series
+    n_bins : int
+    method : {"quantile", "equal_width", "custom"}
+    custom_bins : list, optional
+    special_values : list, optional
+        Example: [-99999, -99998, -99997]
+    categorical_threshold : int
+        Numeric variables with <= this many unique values
+        are treated as categorical.
+
+    Returns
+    -------
+    pd.Series of bin labels
+    """
+
+    special_values = special_values or []
+
+    out = pd.Series(index=s.index, dtype="object")
+
+    # Missing
+    out.loc[s.isna()] = "Missing"
+
+    # Special values
+    for val in special_values:
+        out.loc[s == val] = f"Special:{val}"
+
+    valid = s.notna() & ~s.isin(special_values)
+    sv = s.loc[valid]
+
+    # Categorical / low-cardinality
+    if (
+        not pd.api.types.is_numeric_dtype(sv)
+        or sv.nunique() <= categorical_threshold
+    ):
+        out.loc[valid] = sv.astype(str)
+        return out
+
+    if method == "quantile":
+        binned = pd.qcut(
+            sv,
+            q=n_bins,
+            duplicates="drop"
+        )
+
+    elif method == "equal_width":
+        binned = pd.cut(
+            sv,
+            bins=n_bins,
+            duplicates="drop"
+        )
+
+    elif method == "custom":
+        if custom_bins is None:
+            raise ValueError(
+                "custom_bins must be provided "
+                "when method='custom'"
+            )
+
+        binned = pd.cut(
+            sv,
+            bins=custom_bins,
+            include_lowest=True
+        )
+
+    else:
+        raise ValueError(
+            "method must be 'quantile', "
+            "'equal_width', or 'custom'"
+        )
+
+    # Keep Interval objects for correct ordering
+    out.loc[valid] = binned
+
+    return out
+
+def bad_rate_by_bins(
+    df,
+    attribute,
+    target,
+    n_bins=10,
+    method="quantile",
+    custom_bins=None,
+    special_values=None,
+    min_bin_count=1
+):
+    """
+    Calculate default/bad rate by attribute bin.
+
+    Assumes:
+        target = 1 => bad/default
+        target = 0 => good
+    """
+
+    tmp = df[[attribute, target]].copy()
+
+    tmp["bin"] = make_bins(
+        tmp[attribute],
+        n_bins=n_bins,
+        method=method,
+        custom_bins=custom_bins,
+        special_values=special_values
+    )
+
+    tmp = tmp.dropna(
+        subset=["bin", target]
+    )
+
+    out = (
+        tmp.groupby("bin", observed=True, sort=False)
+        .agg(
+            count=(target, "size"),
+            bad_count=(target, "sum"),
+            bad_rate=(target, "mean")
+        )
+        .reset_index()
+    )
+
+    out["good_count"] = (
+        out["count"] - out["bad_count"]
+    )
+
+    out["good_rate"] = 1 - out["bad_rate"]
+
+    out["volume_pct"] = (
+        out["count"] / out["count"].sum()
+    )
+
+    out = out[
+        out["count"] >= min_bin_count
+    ].copy()
+
+    # Sort numeric interval bins
+    def sort_key(x):
+        if isinstance(x, pd.Interval):
+            return x.left
+        if str(x).startswith("Special:"):
+            return np.inf - 1
+        if x == "Missing":
+            return np.inf
+        return np.nan
+
+    out["_sort"] = out["bin"].apply(sort_key)
+
+    if out["_sort"].notna().any():
+        out = (
+            out
+            .sort_values("_sort")
+            .drop(columns="_sort")
+            .reset_index(drop=True)
+        )
+    else:
+        out = out.drop(columns="_sort")
+
+    out["bin"] = out["bin"].astype(str)
+
+    return out
+
+br = bad_rate_by_bins(
+    df=df,
+    attribute="REV5627",
+    target="default_flag",
+    n_bins=10,
+    method="quantile",
+    special_values=[-99999, -99998, -99997]
+)
+
+display(br)
+
+def calculate_iv(
+    df,
+    attribute,
+    target,
+    n_bins=10,
+    method="quantile",
+    custom_bins=None,
+    special_values=None,
+    smoothing=0.5
+):
+    """
+    Calculate Weight of Evidence and Information Value.
+
+    Assumes:
+        target = 1 => bad
+        target = 0 => good
+
+    Returns
+    -------
+    iv_total : float
+    iv_table : pd.DataFrame
+    """
+
+    tmp = df[[attribute, target]].copy()
+
+    tmp["bin"] = make_bins(
+        tmp[attribute],
+        n_bins=n_bins,
+        method=method,
+        custom_bins=custom_bins,
+        special_values=special_values
+    )
+
+    tmp = tmp.dropna(
+        subset=["bin", target]
+    )
+
+    agg = (
+        tmp.groupby("bin", observed=True, sort=False)
+        .agg(
+            count=(target, "size"),
+            bad=(target, "sum")
+        )
+        .reset_index()
+    )
+
+    agg["good"] = (
+        agg["count"] - agg["bad"]
+    )
+
+    # Smoothing avoids division by zero
+    n_bins_actual = len(agg)
+
+    total_bad = agg["bad"].sum()
+    total_good = agg["good"].sum()
+
+    agg["bad_dist"] = (
+        agg["bad"] + smoothing
+    ) / (
+        total_bad
+        + smoothing * n_bins_actual
+    )
+
+    agg["good_dist"] = (
+        agg["good"] + smoothing
+    ) / (
+        total_good
+        + smoothing * n_bins_actual
+    )
+
+    agg["woe"] = np.log(
+        agg["good_dist"]
+        / agg["bad_dist"]
+    )
+
+    agg["iv_component"] = (
+        agg["good_dist"]
+        - agg["bad_dist"]
+    ) * agg["woe"]
+
+    iv_total = agg["iv_component"].sum()
+
+    agg["bad_rate"] = (
+        agg["bad"] / agg["count"]
+    )
+
+    agg["volume_pct"] = (
+        agg["count"] / agg["count"].sum()
+    )
+
+    agg["bin"] = agg["bin"].astype(str)
+
+    return iv_total, agg
+
+iv, iv_detail = calculate_iv(
+    df=df,
+    attribute="REV5627",
+    target="default_flag",
+    n_bins=10,
+    method="quantile"
+)
+
+print("IV:", iv)
+display(iv_detail)
+
+def univariate_auc_gini(
+    df,
+    attribute,
+    target,
+    special_values=None
+):
+    """
+    Calculate univariate AUC/Gini for a numeric attribute.
+
+    Returns both raw and direction-adjusted values.
+    """
+
+    special_values = special_values or []
+
+    tmp = df[[attribute, target]].copy()
+
+    # Remove missing and special values for raw numeric AUC
+    mask = (
+        tmp[attribute].notna()
+        & tmp[target].notna()
+        & ~tmp[attribute].isin(special_values)
+    )
+
+    tmp = tmp.loc[mask]
+
+    if len(tmp) == 0:
+        return {
+            "attribute": attribute,
+            "auc_raw": np.nan,
+            "auc_strength": np.nan,
+            "gini_raw": np.nan,
+            "gini_strength": np.nan,
+            "direction": None
+        }
+
+    if tmp[target].nunique() < 2:
+        return {
+            "attribute": attribute,
+            "auc_raw": np.nan,
+            "auc_strength": np.nan,
+            "gini_raw": np.nan,
+            "gini_strength": np.nan,
+            "direction": None
+        }
+
+    auc_raw = roc_auc_score(
+        tmp[target],
+        tmp[attribute]
+    )
+
+    # Direction-independent discrimination
+    if auc_raw >= 0.5:
+        auc_strength = auc_raw
+        direction = "higher attribute -> higher default risk"
+    else:
+        auc_strength = 1 - auc_raw
+        direction = "higher attribute -> lower default risk"
+
+    gini_raw = 2 * auc_raw - 1
+
+    gini_strength = (
+        2 * auc_strength - 1
+    )
+
+    return {
+        "attribute": attribute,
+        "auc_raw": auc_raw,
+        "auc_strength": auc_strength,
+        "gini_raw": gini_raw,
+        "gini_strength": gini_strength,
+        "direction": direction
+    }
+
+auc_result = univariate_auc_gini(
+    df,
+    attribute="REV5627",
+    target="default_flag"
+)
+
+auc_result
+
+def calculate_mutual_information(
+    df,
+    attributes,
+    target,
+    sample_size=None,
+    random_state=42
+):
+    """
+    Calculate mutual information between attributes
+    and binary default target.
+
+    Parameters
+    ----------
+    attributes : list[str]
+    """
+
+    cols = attributes + [target]
+
+    tmp = df[cols].copy()
+
+    if sample_size is not None and len(tmp) > sample_size:
+        tmp = tmp.sample(
+            n=sample_size,
+            random_state=random_state
+        )
+
+    y = tmp[target]
+
+    results = []
+
+    for attr in attributes:
+
+        x = tmp[[attr]].copy()
+
+        # MI cannot directly handle NaN
+        if pd.api.types.is_numeric_dtype(x[attr]):
+
+            # Simple missing treatment
+            median = x[attr].median()
+
+            x[attr] = x[attr].fillna(
+                median
+            )
+
+            discrete = False
+
+        else:
+
+            x[attr] = (
+                x[attr]
+                .fillna("Missing")
+                .astype("category")
+                .cat.codes
+            )
+
+            discrete = True
+
+        mi = mutual_info_classif(
+            x,
+            y,
+            discrete_features=[discrete],
+            random_state=random_state
+        )[0]
+
+        results.append({
+            "attribute": attr,
+            "mutual_information": mi
+        })
+
+    return (
+        pd.DataFrame(results)
+        .sort_values(
+            "mutual_information",
+            ascending=False
+        )
+        .reset_index(drop=True)
+    )
+
+mi_df = calculate_mutual_information(
+    df=df,
+    attributes=top_100_rv_features,
+    target="default_flag",
+    sample_size=300_000
+)
+
+def evaluate_features_against_default(
+    df,
+    attributes,
+    target,
+    n_bins=10,
+    method="quantile",
+    special_values=None,
+    mi_sample_size=300_000,
+    random_state=42
+):
+
+    results = []
+
+    # MI once for all features
+    mi_df = calculate_mutual_information(
+        df=df,
+        attributes=attributes,
+        target=target,
+        sample_size=mi_sample_size,
+        random_state=random_state
+    )
+
+    mi_map = dict(
+        zip(
+            mi_df["attribute"],
+            mi_df["mutual_information"]
+        )
+    )
+
+    for attr in attributes:
+
+        # IV
+        try:
+            iv, _ = calculate_iv(
+                df=df,
+                attribute=attr,
+                target=target,
+                n_bins=n_bins,
+                method=method,
+                special_values=special_values
+            )
+        except Exception:
+            iv = np.nan
+
+        # AUC / Gini
+        try:
+            auc_result = univariate_auc_gini(
+                df=df,
+                attribute=attr,
+                target=target,
+                special_values=special_values
+            )
+        except Exception:
+            auc_result = {
+                "auc_raw": np.nan,
+                "auc_strength": np.nan,
+                "gini_raw": np.nan,
+                "gini_strength": np.nan,
+                "direction": None
+            }
+
+        results.append({
+            "attribute": attr,
+
+            "iv": iv,
+
+            "auc_raw":
+                auc_result["auc_raw"],
+
+            "auc_strength":
+                auc_result["auc_strength"],
+
+            "gini_raw":
+                auc_result["gini_raw"],
+
+            "gini_strength":
+                auc_result["gini_strength"],
+
+            "direction":
+                auc_result["direction"],
+
+            "mutual_information":
+                mi_map.get(attr, np.nan)
+        })
+
+    return pd.DataFrame(results)
+
+default_relationship = evaluate_features_against_default(
+    df=df,
+    attributes=top_100_rv_features,
+    target="default_flag",
+    n_bins=10,
+    method="quantile",
+    special_values=[
+        -99999,
+        -99998,
+        -99997
+    ],
+    mi_sample_size=300_000
+)
